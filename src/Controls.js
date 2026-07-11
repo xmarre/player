@@ -20,8 +20,13 @@ export default function Controls(props) {
   const [position, setPosition] = useState(undefined);
   const [startBuffer, setStartBuffer] = useState(undefined);
   const [duration, setDuration] = useState(undefined);
-  const { player, playerAPI, hls, live, overlayVisible, handleFullscreen, handlePIP, patreon, setPatreonServers, setShowStats, showStats, isMobile, streamData } = props;
+  const { player, playerAPI, hls, live, liveDelay, setLiveDelay, overlayVisible, handleFullscreen, handlePIP, patreon, setPatreonServers, setShowStats, showStats, isMobile, streamData } = props;
   const [currentLevel, setCurrentLevel] = useState(undefined);
+  const [liveDelayDraft, setLiveDelayDraft] = useState(liveDelay);
+
+  useEffect(() => {
+    setLiveDelayDraft(liveDelay);
+  }, [liveDelay]);
 
   useEffect(() => {
     if (!player) return;
@@ -38,11 +43,13 @@ export default function Controls(props) {
 
   useEffect(() => {
     if (!hls) return;
+    let cancelled = false;
 
     const initalize = async () => {
-      while (hls.currentLevel === -1) {
+      while (!cancelled && hls.currentLevel === -1) {
         await sleep(100);
       }
+      if (cancelled || hls.currentLevel === -1 || !hls.levels[hls.currentLevel]) return;
 
       const reversedLevels = hls.levels.slice(0).reverse();
       const currentIndex = reversedLevels.findIndex((tmpLevel) => tmpLevel.attrs.VIDEO === hls.levels[hls.currentLevel].attrs.VIDEO);
@@ -55,6 +62,9 @@ export default function Controls(props) {
     };
 
     initalize();
+    return () => {
+      cancelled = true;
+    };
   }, [hls]);
 
   const playHandler = () => {
@@ -101,6 +111,14 @@ export default function Controls(props) {
   const handleTimeChange = (e, value) => {
     player.currentTime = value;
     setPosition(player.currentTime);
+  };
+
+  const handleLiveDelayChange = (e, value) => {
+    setLiveDelayDraft(Array.isArray(value) ? value[0] : value);
+  };
+
+  const commitLiveDelay = (e, value) => {
+    setLiveDelay(Array.isArray(value) ? value[0] : value);
   };
 
   return (
@@ -196,6 +214,23 @@ export default function Controls(props) {
                             <MenuItem onClick={() => setMenuToShow("")}>
                               <ListItemText>{`< Back`}</ListItemText>
                             </MenuItem>
+                            <Divider />
+                            <Box sx={{ px: 2, pt: 1, pb: 1.5 }}>
+                              <Box sx={{ display: "flex", justifyContent: "space-between", mb: 0.5 }}>
+                                <Typography variant="caption">Stable live delay</Typography>
+                                <Typography variant="caption">{`${Number(liveDelayDraft).toFixed(1)}s`}</Typography>
+                              </Box>
+                              <Slider
+                                min={9}
+                                max={60}
+                                step={0.5}
+                                value={liveDelayDraft}
+                                valueLabelDisplay="auto"
+                                valueLabelFormat={(value) => `${value}s`}
+                                onChange={handleLiveDelayChange}
+                                onChangeCommitted={commitLiveDelay}
+                              />
+                            </Box>
                             <Divider />
                             <MenuItem onClick={handlePlaybackStats}>
                               <ListItemText>Video Stats</ListItemText>

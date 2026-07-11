@@ -12,20 +12,93 @@ import patreonImg from "./assets/patreon.png";
 import { isMobile } from "react-device-detect";
 
 const IDENTIFIER = process.env.REACT_APP_IDENTIFER;
-
-const hlsjsOptions = {
-  debug: false,
-  enableWorker: true,
-  startLevel: JSON.parse(localStorageGetItem("level")) ?? undefined,
-  liveSyncDurationCount: 2,
-  progressive: false, // cause some compability issues related to keyframes
-  lowLatencyMode: true,
-};
-
 const M3U8_BASE = "https://vigor.angelthump.com",
   MSE = Hls.isSupported(),
   WEBSOCKET_URI = "wss://uws.angelthump.com/ws";
-let hls;
+const DEFAULT_LIVE_DELAY = 12;
+const MIN_LIVE_DELAY = 9;
+const MAX_LIVE_DELAY = 60;
+const STALL_RECOVERY_DELAY_MS = 2500;
+const SOURCE_RECOVERY_DELAY_MS = 10000;
+const MANIFEST_RETRY_BASE_DELAY_MS = 2000;
+const MAX_MANIFEST_RECOVERY_ATTEMPTS = 4;
+
+const normalizeLiveDelay = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return DEFAULT_LIVE_DELAY;
+  return Math.round(Math.min(MAX_LIVE_DELAY, Math.max(MIN_LIVE_DELAY, numeric)) * 2) / 2;
+};
+
+const createHlsOptions = (liveDelay) => ({
+  debug: false,
+  enableWorker: true,
+  startLevel: JSON.parse(localStorageGetItem("level")) ?? undefined,
+  liveSyncDuration: liveDelay,
+  liveSyncOnStallIncrease: 0,
+  liveMaxLatencyDuration: liveDelay + 120,
+  maxLiveSyncPlaybackRate: 1,
+  maxBufferLength: Math.max(30, liveDelay + 18),
+  maxMaxBufferLength: Math.max(90, liveDelay + 60),
+  liveSyncMode: "buffered",
+  progressive: false, // cause some compability issues related to keyframes
+  lowLatencyMode: false,
+});
+
+const applyLiveDelay = (hls, liveDelay) => {
+  if (!hls || !hls.config) return;
+  const requestedBuffer = Math.max(30, liveDelay + 18);
+
+  hls.config.lowLatencyMode = false;
+  hls.config.liveSyncDuration = liveDelay;
+  hls.config.liveSyncOnStallIncrease = 0;
+  hls.config.liveMaxLatencyDuration = liveDelay + 120;
+  hls.config.liveMaxLatencyDurationCount = Number.POSITIVE_INFINITY;
+  hls.config.maxLiveSyncPlaybackRate = 1;
+  hls.config.liveSyncMode = "buffered";
+  hls.config.maxBufferLength = Math.max(hls.config.maxBufferLength || 0, requestedBuffer);
+  hls.config.maxMaxBufferLength = Math.max(hls.config.maxMaxBufferLength || 0, requestedBuffer + 60);
+
+  try {
+    hls.lowLatencyMode = false;
+    hls.targetLatency = liveDelay;
+  } catch (e) {
+    // hls.js builds without writable accessors still use the config above.
+  }
+};
+
+const getForwardBuffer = (player) => {
+  if (!player || !player.buffered) return 0;
+  const currentTime = player.currentTime;
+
+  for (let i = 0; i < player.buffered.length; i++) {
+    const start = player.buffered.start(i);
+    const end = player.buffered.end(i);
+    if (currentTime >= start - 0.1 && currentTime <= end + 0.1) return Math.max(0, end - currentTime);
+  }
+  return 0;
+};
+
+const clampToSeekable = (player, requested) => {
+  if (!player || !player.seekable || player.seekable.length === 0 || !Number.isFinite(requested)) return null;
+
+  let nearest = null;
+  for (let i = 0; i < player.seekable.length; i++) {
+    const start = player.seekable.start(i);
+    const end = player.seekable.end(i);
+    const safeStart = Math.min(end, start + 0.1);
+    const safeEnd = Math.max(start, end - 0.1);
+
+    if (requested >= start - 0.5 && requested <= end + 0.5) {
+      return Math.min(safeEnd, Math.max(safeStart, requested));
+    }
+
+    const candidate = requested < safeStart ? safeStart : safeEnd;
+    const distance = Math.abs(candidate - requested);
+    if (!nearest || distance < nearest.distance) nearest = { position: candidate, distance };
+  }
+
+  return nearest ? nearest.position : null;
+};
 
 const getToken = async (channel, usePatreonServers) => {
   const token = await fetch(`https://vigor.angelthump.com/${channel}/token`, {
@@ -52,9 +125,17 @@ export default function Player(props) {
   const { channel, streamData, userData } = props;
   const [live, setLive] = useState(streamData && streamData.type === "live");
   const [player, setPlayer] = useState(null);
+  const [hls, setHls] = useState(null);
   const [videoContainer, setVideoContainer] = useState(null);
   const [overlayVisible, setOverlayVisible] = useState(true);
   const [usePatreonServers, setPatreonServers] = useState(JSON.parse(localStorageGetItem("patreon")) || false);
+  const [liveDelay, setLiveDelayState] = useState(() => {
+    try {
+      return normalizeLiveDelay(JSON.parse(localStorageGetItem("liveDelay")));
+    } catch (e) {
+      return DEFAULT_LIVE_DELAY;
+    }
+  });
   const [showStats, setShowStats] = useState(false);
   const [playerAPI, setPlayerAPI] = useState({
     fullscreen: false,
@@ -65,6 +146,15 @@ export default function Player(props) {
   });
   const [showPlayOverlay, setShowPlayOverlay] = useState(false);
   const ws = useRef(null);
+  const hlsRef = useRef(null);
+  const liveDelayRef = useRef(liveDelay);
+  liveDelayRef.current = liveDelay;
+
+  const setLiveDelay = useCallback((value) => {
+    const normalized = normalizeLiveDelay(value);
+    localStorageSetItem("liveDelay", normalized);
+    setLiveDelayState(normalized);
+  }, []);
 
   const videoRef = useCallback((node) => {
     setPlayer(node);
@@ -112,10 +202,119 @@ export default function Player(props) {
   useEffect(() => {
     if (!player || !channel) return;
 
+    const source = `${M3U8_BASE}/hls/${channel}.m3u8`;
+    let disposed = false;
+    let currentHls = null;
+    let stallRecoveryTimer = null;
+    let sourceRecoveryTimer = null;
+    let manifestRecoveryTimer = null;
+    let manifestRecoveryAttempts = 0;
+    let manifestRecoveryInFlight = false;
+
+    const clearStallRecovery = () => {
+      if (stallRecoveryTimer !== null) clearTimeout(stallRecoveryTimer);
+      if (sourceRecoveryTimer !== null) clearTimeout(sourceRecoveryTimer);
+      stallRecoveryTimer = null;
+      sourceRecoveryTimer = null;
+    };
+
+    const clearManifestRecovery = () => {
+      if (manifestRecoveryTimer !== null) clearTimeout(manifestRecoveryTimer);
+      manifestRecoveryTimer = null;
+    };
+
+    const loadSourceWithFreshToken = async (instance) => {
+      const token = await getToken(channel, usePatreonServers);
+      if (disposed || hlsRef.current !== instance) return false;
+      if (!token) {
+        if (usePatreonServers) {
+          alert("Not a patron or not logged in!");
+          localStorageSetItem("patreon", false);
+          setPatreonServers(false);
+        }
+        return false;
+      }
+
+      instance.loadSource(`${source}?token=${token}`);
+      instance.startLoad();
+      void player.play().catch(() => {});
+      return true;
+    };
+
+    const scheduleManifestRecovery = (instance) => {
+      if (disposed || hlsRef.current !== instance || manifestRecoveryTimer !== null) return;
+      if (manifestRecoveryAttempts >= MAX_MANIFEST_RECOVERY_ATTEMPTS) return;
+
+      const delay = MANIFEST_RETRY_BASE_DELAY_MS * Math.pow(2, manifestRecoveryAttempts);
+      manifestRecoveryTimer = setTimeout(async () => {
+        manifestRecoveryTimer = null;
+        if (manifestRecoveryInFlight) {
+          scheduleManifestRecovery(instance);
+          return;
+        }
+        manifestRecoveryInFlight = true;
+        manifestRecoveryAttempts += 1;
+        const recovered = await loadSourceWithFreshToken(instance);
+        manifestRecoveryInFlight = false;
+        if (!recovered) scheduleManifestRecovery(instance);
+      }, delay);
+    };
+
+    const scheduleStallRecovery = () => {
+      clearStallRecovery();
+      const instance = hlsRef.current;
+      if (!instance) return;
+
+      stallRecoveryTimer = setTimeout(() => {
+        stallRecoveryTimer = null;
+        if (
+          disposed ||
+          hlsRef.current !== instance ||
+          player.paused ||
+          player.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA ||
+          getForwardBuffer(player) > 0.5
+        ) {
+          return;
+        }
+
+        try {
+          instance.resumeBuffering?.();
+          instance.startLoad(player.currentTime);
+        } catch (e) {
+          console.error(e);
+        }
+
+        sourceRecoveryTimer = setTimeout(() => {
+          sourceRecoveryTimer = null;
+          if (
+            disposed ||
+            hlsRef.current !== instance ||
+            player.paused ||
+            player.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA ||
+            getForwardBuffer(player) > 0.5
+          ) {
+            return;
+          }
+          scheduleManifestRecovery(instance);
+        }, SOURCE_RECOVERY_DELAY_MS - STALL_RECOVERY_DELAY_MS);
+      }, STALL_RECOVERY_DELAY_MS);
+    };
+
+    const onFullscreenChange = () => {
+      const isInFullScreen =
+        (document.fullscreenElement && document.fullscreenElement !== null) ||
+        (document.webkitFullscreenElement && document.webkitFullscreenElement !== null) ||
+        (document.mozFullScreenElement && document.mozFullScreenElement !== null) ||
+        (document.msFullscreenElement && document.msFullscreenElement !== null);
+      setPlayerAPI((playerAPI) => ({ ...playerAPI, fullscreen: isInFullScreen }));
+    };
+
     canAutoplay.video({ inline: true }).then(async (obj) => {
+      if (disposed) return;
       if (obj.result) return (player.muted = JSON.parse(localStorageGetItem("muted")) || false);
 
       let mutedAutoplay = await canAutoplay.video({ muted: true, inline: true });
+      if (disposed) return;
       if (mutedAutoplay.result) return (player.muted = true);
 
       //If autoplay && muted autoplay doesn't work, display play overlay.
@@ -135,82 +334,89 @@ export default function Player(props) {
     };
 
     player.onplaying = () => {
+      clearStallRecovery();
+      manifestRecoveryAttempts = 0;
       setPlayerAPI((playerAPI) => ({ ...playerAPI, buffering: false }));
     };
 
     player.onwaiting = () => {
       setPlayerAPI((playerAPI) => ({ ...playerAPI, buffering: true }));
+      scheduleStallRecovery();
     };
 
+    player.onstalled = scheduleStallRecovery;
+
     player.onpause = () => {
+      clearStallRecovery();
       setPlayerAPI((playerAPI) => ({ ...playerAPI, paused: true, buffering: false }));
       setShowPlayOverlay(true);
     };
 
     player.onerror = async () => {
-      if (player.error.code === 4) {
+      if (player.error && player.error.code === 4) {
         console.info(`Edge is down. Retry..`);
-        if (MSE && hls) {
-          const token = await getToken(channel, usePatreonServers);
-          if (!token) {
-            if (usePatreonServers) {
-              alert("Not a patron or not logged in!");
-              localStorageSetItem("patreon", false);
-              setPatreonServers(false);
-            }
-            return;
-          }
-          hls.loadSource(`${source}?token=${token}`);
+        if (MSE && hlsRef.current) {
+          scheduleManifestRecovery(hlsRef.current);
         } else {
           loadNative();
         }
       }
     };
 
-    document.addEventListener("fullscreenchange", (e) => {
-      const isInFullScreen =
-        (document.fullscreenElement && document.fullscreenElement !== null) ||
-        (document.webkitFullscreenElement && document.webkitFullscreenElement !== null) ||
-        (document.mozFullScreenElement && document.mozFullScreenElement !== null) ||
-        (document.msFullscreenElement && document.msFullscreenElement !== null);
-      setPlayerAPI((playerAPI) => ({ ...playerAPI, fullscreen: isInFullScreen }));
-    });
+    document.addEventListener("fullscreenchange", onFullscreenChange);
 
-    const source = `${M3U8_BASE}/hls/${channel}.m3u8`;
     player.volume = JSON.parse(localStorageGetItem("volume")) || 1;
     setPlayerAPI((playerAPI) => ({ ...playerAPI, source: source, volume: player.volume, muted: player.muted }));
 
     const loadHLS = () => {
-      hls = new Hls(hlsjsOptions);
-      hls.attachMedia(player);
-      hls.on(Hls.Events.MEDIA_ATTACHED, async () => {
+      const instance = new Hls(createHlsOptions(liveDelayRef.current));
+      currentHls = instance;
+      hlsRef.current = instance;
+      setHls(instance);
+      instance.attachMedia(player);
+
+      instance.on(Hls.Events.MEDIA_ATTACHED, async () => {
         console.info("HLS attached to media");
-        const token = await getToken(channel, usePatreonServers);
-        if (!token) {
-          if (usePatreonServers) {
-            alert("Not a patron or not logged in!");
-            localStorageSetItem("patreon", false);
-            setPatreonServers(false);
-          }
-          return;
-        }
-        hls.loadSource(`${source}?token=${token}`);
-        player.play();
+        const loaded = await loadSourceWithFreshToken(instance);
+        if (!loaded) scheduleManifestRecovery(instance);
       });
 
-      hls.on(Hls.Events.ERROR, (event, data) => {
+      instance.on(Hls.Events.MANIFEST_PARSED, () => {
+        manifestRecoveryAttempts = 0;
+        clearManifestRecovery();
+      });
+
+      instance.on(Hls.Events.FRAG_BUFFERED, () => {
+        clearStallRecovery();
+      });
+
+      instance.on(Hls.Events.ERROR, (event, data) => {
         if (data.fatal) {
           switch (data.type) {
             case Hls.ErrorTypes.NETWORK_ERROR:
               console.error(data);
-              if (data.details !== "manifestLoadError") hls.startLoad();
+              if (data.details === Hls.ErrorDetails?.MANIFEST_LOAD_ERROR || data.details === "manifestLoadError") {
+                scheduleManifestRecovery(instance);
+              } else {
+                try {
+                  instance.resumeBuffering?.();
+                  instance.startLoad(player.currentTime);
+                } catch (e) {
+                  console.error(e);
+                }
+              }
               break;
             case Hls.ErrorTypes.MEDIA_ERROR:
               console.error(data);
-              hls.recoverMediaError();
+              instance.recoverMediaError();
               break;
             default:
-              hls.destroy();
+              if (hlsRef.current === instance) hlsRef.current = null;
+              instance.destroy();
+              setHls(null);
+              setTimeout(() => {
+                if (!disposed && !hlsRef.current) loadHLS();
+              }, MANIFEST_RETRY_BASE_DELAY_MS);
               break;
           }
         } else {
@@ -218,7 +424,7 @@ export default function Player(props) {
             case Hls.ErrorTypes.OTHER_ERROR:
               if (data.details === "levelSwitchError") {
                 console.error(data);
-                localStorageSetItem(`level`, hls.firstLevel);
+                localStorageSetItem(`level`, instance.firstLevel);
               }
               break;
             default:
@@ -231,6 +437,7 @@ export default function Player(props) {
 
     const loadNative = async () => {
       const token = await getToken(channel, usePatreonServers);
+      if (disposed) return;
       if (!token) {
         if (usePatreonServers) {
           alert("Not a patron or not logged in!");
@@ -252,9 +459,81 @@ export default function Player(props) {
     }
 
     return () => {
-      if (hls) hls.destroy();
+      disposed = true;
+      clearStallRecovery();
+      clearManifestRecovery();
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
+      player.onvolumechange = null;
+      player.onplay = null;
+      player.onplaying = null;
+      player.onwaiting = null;
+      player.onstalled = null;
+      player.onpause = null;
+      player.onerror = null;
+      if (currentHls) currentHls.destroy();
+      if (hlsRef.current === currentHls) hlsRef.current = null;
     };
-  }, [player, channel, usePatreonServers, live]);
+  }, [player, channel, usePatreonServers, live]); // live restarts playback after an offline/online transition
+
+  useEffect(() => {
+    const instance = hls;
+    if (!player || !instance || hlsRef.current !== instance) return;
+
+    applyLiveDelay(instance, liveDelay);
+
+    const reposition = () => {
+      if (hlsRef.current !== instance) return;
+      const syncPosition = instance.liveSyncPosition;
+      if (!Number.isFinite(syncPosition)) return;
+      const target = clampToSeekable(player, syncPosition);
+      if (!Number.isFinite(target) || Math.abs(player.currentTime - target) < 0.5) return;
+
+      const resume = !player.paused && !player.ended;
+      player.currentTime = target;
+      try {
+        instance.resumeBuffering?.();
+        instance.startLoad(target);
+      } catch (e) {
+        console.error(e);
+      }
+      if (resume) void player.play().catch(() => {});
+    };
+
+    if (instance.latestLevelDetails) {
+      reposition();
+      return;
+    }
+
+    instance.on(Hls.Events.LEVEL_UPDATED, reposition);
+    return () => instance.off(Hls.Events.LEVEL_UPDATED, reposition);
+  }, [player, hls, liveDelay]);
+
+  useEffect(() => {
+    if (!player) return;
+
+    const interval = setInterval(() => {
+      const instance = hlsRef.current;
+      if (!instance || !instance.latestLevelDetails || player.readyState === HTMLMediaElement.HAVE_NOTHING) return;
+
+      const latency = Number(instance.latency);
+      if (!Number.isFinite(latency) || latency <= 0 || latency >= liveDelay - 1) return;
+
+      const syncPosition = instance.liveSyncPosition;
+      if (!Number.isFinite(syncPosition)) return;
+      const target = clampToSeekable(player, syncPosition);
+      if (!Number.isFinite(target) || Math.abs(player.currentTime - target) < 0.5) return;
+
+      player.currentTime = target;
+      try {
+        instance.resumeBuffering?.();
+        instance.startLoad(target);
+      } catch (e) {
+        console.error(e);
+      }
+    }, 500);
+
+    return () => clearInterval(interval);
+  }, [player, liveDelay]);
 
   const disableOverlay = () => {
     if (!overlayVisible) return;
@@ -378,6 +657,8 @@ export default function Player(props) {
                 playerAPI={playerAPI}
                 hls={hls}
                 live={live}
+                liveDelay={liveDelay}
+                setLiveDelay={setLiveDelay}
                 overlayVisible={live ? overlayVisible : true}
                 handleFullscreen={handleFullscreen}
                 handlePIP={handlePIP}
